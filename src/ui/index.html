@@ -1,0 +1,257 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Cross-source spectral shaper</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header>
+  <h1>Cross-source spectral shaper</h1>
+  <p class="scope">
+    A slowly varying <em>spectral envelope</em> is estimated from a donor and used to
+    re-weight a carrier's excitation structure. This is cross-synthesis, not
+    source/filter separation; the output is a new sound, not an unmixed donor or carrier.
+  </p>
+</header>
+
+<main>
+  <section class="panel controls">
+    <fieldset>
+      <legend>Donor (envelope source)</legend>
+      <label>Preset
+        <select id="donorPreset">
+          <option value="sweepingVowel">Sweeping vowel (resonator, formant drift)</option>
+          <option value="staticNasal">Static nasal vowel</option>
+          <option value="brightBandLimited">Bright band-limited (no top octave)</option>
+          <option value="noiseCloud">Noise-excited formant cloud</option>
+          <option value="file">Load file…</option>
+        </select>
+      </label>
+      <label>Duration (s) <input id="donorDuration" type="number" min="0.25" max="30" step="0.25" value="4"></label>
+      <label>Load donor file <input id="donorFile" type="file" accept="audio/*"></label>
+      <p class="hint" id="donorInfo">generated at run</p>
+    </fieldset>
+
+    <fieldset>
+      <legend>Carrier (excitation source)</legend>
+      <label>Preset
+        <select id="carrierPreset">
+          <option value="pulse220">Pulse train 220 Hz</option>
+          <option value="pulse90">Pulse train 90 Hz</option>
+          <option value="pulse330">Pulse train 330 Hz</option>
+          <option value="whiteNoise">White noise</option>
+          <option value="pinkNoise">Pink noise</option>
+          <option value="file">Load file…</option>
+        </select>
+      </label>
+      <label>Duration (s) <input id="carrierDuration" type="number" min="0.25" max="30" step="0.25" value="4"></label>
+      <label>Pulse f0 (Hz) <input id="carrierF0" type="number" min="40" max="1200" step="1" value="220"></label>
+      <label>Load carrier file <input id="carrierFile" type="file" accept="audio/*"></label>
+      <p class="hint" id="carrierInfo">generated at run</p>
+    </fieldset>
+
+    <fieldset>
+      <legend>Analysis</legend>
+      <label>FFT size
+        <select id="fftSize">
+          <option>1024</option>
+          <option selected>2048</option>
+          <option>4096</option>
+        </select>
+      </label>
+      <label>Overlap
+        <select id="overlap">
+          <option value="4">4× (hop = FFT/4)</option>
+          <option value="2">2× (hop = FFT/2)</option>
+          <option value="1">none (hop = FFT)</option>
+        </select>
+      </label>
+      <label>Bands / octave
+        <select id="bandsPerOctave">
+          <option>6</option>
+          <option selected>12</option>
+          <option>24</option>
+        </select>
+      </label>
+      <label>Band range (Hz)
+        <span class="pair">
+          <input id="fMin" type="number" min="20" step="10" value="60">
+          <input id="fMax" type="number" min="100" step="100" value="8000">
+        </span>
+      </label>
+      <label>Envelope smoothing (s)
+        <input id="envSmoothSec" type="range" min="0.02" max="0.6" step="0.01" value="0.15">
+        <output id="envSmoothOut">0.15</output>
+      </label>
+      <label>Noise floor below frame peak (dB)
+        <input id="noiseFloorDb" type="range" min="40" max="120" step="5" value="90">
+        <output id="noiseFloorOut">90</output>
+      </label>
+      <label>Observability threshold
+        <input id="confidenceThreshold" type="range" min="0.1" max="0.9" step="0.05" value="0.5">
+        <output id="confidenceOut">0.50</output>
+      </label>
+    </fieldset>
+
+    <fieldset>
+      <legend>Time correspondence</legend>
+      <label>Time map
+        <select id="timeMap">
+          <option value="stretch">Stretch donor across carrier</option>
+          <option value="start">Start-aligned</option>
+          <option value="offset">Start-aligned with offset</option>
+        </select>
+      </label>
+      <label>Offset (s) <input id="timeOffsetSec" type="number" step="0.05" value="0"></label>
+      <label>Uncovered time
+        <select id="timeGapMode">
+          <option value="hold">Hold last donor frame</option>
+          <option value="bypass">Bypass (leave carrier)</option>
+        </select>
+      </label>
+      <label>Output duration (s) <input id="outputDurationSec" type="number" min="0.1" max="60" step="0.1" placeholder="= carrier"></label>
+      <label>Work rate
+        <select id="workRate">
+          <option value="">auto (max input, ≤48 kHz)</option>
+          <option>22050</option>
+          <option>32000</option>
+          <option>44100</option>
+          <option>48000</option>
+        </select>
+      </label>
+    </fieldset>
+
+    <details open>
+      <summary>Gap and gain policy</summary>
+      <fieldset>
+        <legend>Unobserved donor bands</legend>
+        <label>Frequency gap
+          <select id="freqGapMode">
+            <option value="extrapolate">Bounded extrapolation</option>
+            <option value="hold">Hold nearest observed band</option>
+            <option value="bypass">Bypass (no shaping there)</option>
+          </select>
+        </label>
+        <label>Max extrapolation rise (dB)
+          <input id="extrapolateMaxRiseDb" type="number" min="0" max="30" step="1" value="6">
+        </label>
+        <label>Max extrapolation fall (dB)
+          <input id="extrapolateMaxFallDb" type="number" min="0" max="60" step="1" value="18">
+        </label>
+      </fieldset>
+      <fieldset>
+        <legend>Gain limits</legend>
+        <label>Max boost (dB) <input id="maxBoostDb" type="number" min="0" max="40" step="1" value="18"></label>
+        <label>Max cut (dB) <input id="maxCutDb" type="number" min="0" max="120" step="1" value="60"></label>
+        <label>Excitation range (dB below frame peak)
+          <input id="excitationRangeDb" type="number" min="20" max="120" step="5" value="70">
+        </label>
+        <label>Excitation floor (0–1)
+          <input id="excitationFloor" type="number" min="0" max="1" step="0.01" value="0.10">
+        </label>
+      </fieldset>
+      <fieldset>
+        <legend>Output level</legend>
+        <label class="check"><input id="preserveCarrierLoudness" type="checkbox" checked> Follow carrier loudness contour</label>
+        <label>Gain mode
+          <select id="outputGainMode">
+            <option value="carrier-rms">Match carrier RMS (explicit)</option>
+            <option value="unity">Unity (no makeup)</option>
+            <option value="explicit">Explicit gain</option>
+          </select>
+        </label>
+        <label>Explicit gain (dB) <input id="outputGainDb" type="number" min="-60" max="30" step="0.5" value="0"></label>
+        <label>Peak ceiling <input id="peakCeiling" type="number" min="0.1" max="1" step="0.01" value="0.98"></label>
+      </fieldset>
+    </details>
+
+    <div class="actions">
+      <button id="run" class="primary">Run</button>
+      <button id="defaults" type="button">Reset defaults</button>
+    </div>
+    <p id="status" class="status">ready</p>
+  </section>
+
+  <section class="panel results">
+    <div class="playback">
+      <strong>Solo listening</strong>
+      <span class="hint">Each button plays one stage only. Output is the final combination.</span>
+      <div class="buttons">
+        <button data-solo="donor">Donor</button>
+        <button data-solo="carrier">Carrier</button>
+        <button data-solo="excitation">Excitation proxy</button>
+        <button data-solo="spectral">Spectral stage (pre-level)</button>
+        <button data-solo="output" class="primary">Output</button>
+        <button id="stop">Stop</button>
+      </div>
+      <div class="nowplaying"><span id="nowPlaying">nothing playing</span>
+        <progress id="progress" max="1" value="0"></progress>
+      </div>
+    </div>
+
+    <div class="vizgrid">
+      <figure>
+        <figcaption>Donor spectral envelope (dB)</figcaption>
+        <canvas id="canvDonorEnv"></canvas>
+      </figure>
+      <figure>
+        <figcaption>Carrier spectral envelope (dB)</figcaption>
+        <canvas id="canvCarrierEnv"></canvas>
+      </figure>
+      <figure>
+        <figcaption>Output spectral envelope (dB)</figcaption>
+        <canvas id="canvOutputEnv"></canvas>
+      </figure>
+      <figure>
+        <figcaption>Applied gain per bin (blue cut · orange boost)</figcaption>
+        <canvas id="canvGain"></canvas>
+      </figure>
+      <figure>
+        <figcaption>Masks: green = carrier excitation · blue = unexcited · red = donor unobserved (bright = gap-filled) · dark = neither</figcaption>
+        <canvas id="canvMasks"></canvas>
+      </figure>
+      <figure>
+        <figcaption>Envelope trend at the evidence band (mean-removed dB)</figcaption>
+        <canvas id="canvTrend"></canvas>
+      </figure>
+      <figure>
+        <figcaption>Donor spectrogram</figcaption>
+        <canvas id="canvDonorSpec"></canvas>
+      </figure>
+      <figure>
+        <figcaption>Carrier spectrogram</figcaption>
+        <canvas id="canvCarrierSpec"></canvas>
+      </figure>
+      <figure>
+        <figcaption>Spectral-stage spectrogram</figcaption>
+        <canvas id="canvSpectralSpec"></canvas>
+      </figure>
+      <figure>
+        <figcaption>Output spectrogram</figcaption>
+        <canvas id="canvOutputSpec"></canvas>
+      </figure>
+      <figure class="wide">
+        <figcaption>Amplitude envelope (broadband frame RMS, dBFS) — donor / carrier / output</figcaption>
+        <canvas id="canvAmp"></canvas>
+      </figure>
+    </div>
+
+    <div id="report" class="report">
+      <p class="hint">Run to produce the measurement report.</p>
+    </div>
+  </section>
+</main>
+
+<footer>
+  <p>
+    Envelope scale: dB re. a full-scale sinusoid's peak bin. Frequency: FFT bins, with a
+    log-spaced band grid for gap handling and display. Gain: per-bin dB after removing each
+    side's own envelope reference, so absolute level is not transplanted.
+  </p>
+</footer>
+
+<script type="module" src="app.js"></script>
+</body>
+</html>
