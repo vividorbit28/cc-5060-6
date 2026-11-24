@@ -1,0 +1,50 @@
+{
+  "generatedBy": "tests/golden/envelope.json",
+  "note": "Deterministic numeric regression for the spectral envelope and the cross-synthesis gain stage. Values are locked to the current (patched) implementation; regenerate only with a reviewed change.",
+  "envelope": {
+    "source": "resonantTone f0=120, formants 600/1800, amp 0.6, 1 s, no modulation",
+    "fftSize": 1024,
+    "hop": 256,
+    "rate": 22050,
+    "bandsPerOctave": 12,
+    "fMin": 60,
+    "fMax": 8000,
+    "frame": 40,
+    "centresHz": [
+      60,
+      212.9,
+      713.1,
+      2529.9,
+      8000
+    ],
+    "smoothedDb": [
+      -37.768,
+      -37.032,
+      -45.55,
+      -103.126,
+      -110
+    ],
+    "rawDb": [
+      -53.653,
+      -20.291,
+      -32.03,
+      -100.47,
+      -110
+    ],
+    "framePeakDb": -33.217
+  },
+  "cross": {
+    "options": {
+      "fftSize": 1024,
+      "hop": 256
+    },
+    "trendOutputVsDonor": 0.7954,
+    "trendOutputVsCarrier": 0.098,
+    "spectralFitMeanAbsDb": 3.6661,
+    "energyRatio": 1,
+    "maxGainInUnexcitedDb": 0,
+    "gainMax": 5.1166,
+    "gainMin": -39.0288,
+    "outputOverCarrierRms": 1
+  }
+}

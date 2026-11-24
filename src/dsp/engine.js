@@ -40,6 +40,7 @@ import {
   smoothstep,
   clamp01,
   lifterSamplesForPeriod,
+  frameTimesOf,
 } from './envelope.js';
 
 export const DEFAULT_OPTIONS = Object.freeze({
@@ -67,6 +68,24 @@ export const DEFAULT_OPTIONS = Object.freeze({
   maxCutDb: 60,
   excitationRangeDb: 70,
   excitationFloor: 0.10,
+  // Absolute support floor, dB re. the full-scale peak-bin reference. A frame
+  // whose loudest bin is below this has no measurable content: relative support
+  // (bin vs frame peak) is meaningless when the frame peak is numerical zero,
+  // because every bin would then read 0 dB below the peak.
+  absoluteSupportFloorDb: -150,
+  // What the spectral-onramp does when the donor has no valid source spectrum
+  // (silence, or below absoluteSupportFloorDb) for a carrier frame:
+  //   'refuse' - do not write a gain for that frame; pass the carrier through
+  //              and report the refused write. The default, because writing a
+  //              shape derived from a numerical floor is exactly the amplified
+  //              wrong envelope we must not leave behind.
+  //   'hold'   - defer to the most recent valid donor frame (carry the last
+  //              good spectrum) and report the held write.
+  lowEnergyPolicy: 'refuse',
+  // Spectral-edit overlay gain, dB per band, applied on top of the donor shape.
+  // A sparse list of { band, db } points; empty by default. The spectral edit
+  // window drives this through the same kernel the tests exercise.
+  envelopeEdit: null,
   preserveCarrierLoudness: true,
   loudnessFrameSec: 0.02,
   maxMakeupDb: 30,
@@ -218,6 +237,38 @@ function fillShape(shapeDb, conf, threshold, mode, bounds) {
   return { shape: out, filled, observed, any: true, first, last };
 }
 
+// Apply a sparse band-domain edit (dB offsets at band indices) on top of the
+// gap-resolved donor shape. Points are linearly interpolated across band index
+// and held at the endpoints, so a edit at one band does not step the whole
+// neighbouring band. This is the kernel the spectral-edit window drives.
+function applyEnvelopeEdit(shape, edit, nb) {
+  if (!edit || !edit.length) return shape;
+  const pts = edit
+    .filter((p) => Number.isFinite(p.band) && Number.isFinite(p.db))
+    .map((p) => ({ band: Math.max(0, Math.min(nb - 1, p.band)), db: p.db }))
+    .sort((a, b) => a.band - b.band);
+  if (!pts.length) return shape;
+  const out = Float32Array.from(shape);
+  for (let b = 0; b < nb; b++) {
+    let db = 0;
+    if (b <= pts[0].band) db = pts[0].db;
+    else if (b >= pts[pts.length - 1].band) db = pts[pts.length - 1].db;
+    else {
+      for (let i = 1; i < pts.length; i++) {
+        if (b <= pts[i].band) {
+          const a = pts[i - 1];
+          const c = pts[i];
+          const f = (b - a.band) / Math.max(1, c.band - a.band);
+          db = a.db + (c.db - a.db) * f;
+          break;
+        }
+      }
+    }
+    out[b] += db;
+  }
+  return out;
+}
+
 // ---------------------------------------------------------------------------
 // Time correspondence
 // ---------------------------------------------------------------------------
@@ -294,6 +345,7 @@ function excitationSupport(spec, options, bandRanges, nbBands) {
   const support = new Array(frames);
   const unexcited = new Array(frames);
   const peaks = new Float32Array(frames);
+  const absFloor = options.absoluteSupportFloorDb;
   for (let t = 0; t < frames; t++) {
     const p = power[t];
     let framePeak = 0;
@@ -302,6 +354,12 @@ function excitationSupport(spec, options, bandRanges, nbBands) {
     peaks[t] = framePeakDb;
     const sup = new Float32Array(bins);
     const unex = new Uint8Array(bins);
+    // A frame with no measurable content (digital silence, or a peak below the
+    // absolute support floor) cannot carry excitation anywhere. Without this
+    // test the relative measure degenerates: a zero frame peak makes every bin
+    // read 0 dB below the peak, smoothstep returns 1, and silence is declared
+    // fully excited. That let a silent or dithered carrier receive boost.
+    const frameHasContent = framePeakDb > absFloor;
     // Reference is the *frame* peak, not the per-band peak. A partial that is
     // 40 dB below the frame's loudest is still excitation; a bin 100 dB down is
     // numerical floor. Using the per-band peak would mark every band's own
@@ -309,6 +367,7 @@ function excitationSupport(spec, options, bandRanges, nbBands) {
     for (let b = 0; b < nbBands; b++) {
       const [k0, k1] = bandRanges[b];
       for (let k = k0; k <= k1; k++) {
+        if (!frameHasContent) { sup[k] = 0; unex[k] = 1; continue; }
         const rel = powerToDb(p[k]) - framePeakDb;
         const s = smoothstep(-options.excitationRangeDb, -6, rel);
         sup[k] = s;
@@ -402,9 +461,20 @@ export function crossSynthesize(donorSignal, carrierSignal, userOptions = {}) {
   const kLo = Math.max(1, Math.ceil(envFMin / binHz));
   const kHi = Math.min(bins - 1, Math.floor(envFMax / binHz));
 
-  // Slow time smoothing belongs to the donor only.
-  const donorEnvDb = smoothEnvelopeTime(donor.env.db, hopSec, options.envSmoothSec);
-  const carrierEnvDb = smoothEnvelopeTime(carrier.env.db, hopSec, Math.min(0.04, options.envSmoothSec / 4));
+  // Slow time smoothing belongs to the donor only. A frame below the absolute
+  // support floor has no source spectrum; smoothing must not average its
+  // numerical floor into a neighbouring valid frame, and the first valid frame
+  // after a silent run must start from its own measurement (the reset rule).
+  const donorValid = new Uint8Array(donorFrames);
+  for (let t = 0; t < donorFrames; t++) {
+    donorValid[t] = donor.env.rawPeakDb[t] > options.absoluteSupportFloorDb ? 1 : 0;
+  }
+  const carrierValid = new Uint8Array(carrier.spec.frames);
+  for (let t = 0; t < carrier.spec.frames; t++) {
+    carrierValid[t] = carrier.env.rawPeakDb[t] > options.absoluteSupportFloorDb ? 1 : 0;
+  }
+  const donorEnvDb = smoothEnvelopeTime(donor.env.db, hopSec, options.envSmoothSec, donorValid);
+  const carrierEnvDb = smoothEnvelopeTime(carrier.env.db, hopSec, Math.min(0.04, options.envSmoothSec / 4), carrierValid);
   const donorEnv = { ...donor.env, db: donorEnvDb };
   const carrierEnv = { ...carrier.env, db: carrierEnvDb };
 
@@ -413,6 +483,10 @@ export function crossSynthesize(donorSignal, carrierSignal, userOptions = {}) {
   const donorFill = new Array(donorFrames);
   const donorObs = new Array(donorFrames);
   const donorRefs = new Float32Array(donorFrames);
+  // A donor frame with no source spectrum has no valid reference. Its shape is
+  // not written as evidence: the frame is provisional and downstream frames
+  // must not consume it as if it were a measurement.
+  const donorFrameValid = new Uint8Array(donorFrames);
   const bounds = {
     floorDb: 160,
     maxRiseDb: options.extrapolateMaxRiseDb,
@@ -420,10 +494,21 @@ export function crossSynthesize(donorSignal, carrierSignal, userOptions = {}) {
   };
   for (let t = 0; t < donorFrames; t++) {
     const conf = donor.env.support[t];
+    const valid = donorValid[t] === 1;
+    donorFrameValid[t] = valid ? 1 : 0;
     const ref = bandReferenceDb(donorEnvDb[t], conf, threshold);
     donorRefs[t] = ref;
     const shape = new Float32Array(nb);
     for (let b = 0; b < nb; b++) shape[b] = donorEnvDb[t][b] - ref;
+    if (!valid) {
+      // No valid source spectrum: leave every band unobserved and unfilled, so
+      // the caller can hold or reject the transfer for this frame instead of
+      // writing a floor-derived shape.
+      donorShapes[t] = shape;
+      donorFill[t] = new Uint8Array(nb);
+      donorObs[t] = new Float32Array(nb);
+      continue;
+    }
     if (options.freqGapMode === 'bypass') {
       donorShapes[t] = shape;
       donorFill[t] = new Uint8Array(nb);
@@ -454,7 +539,15 @@ export function crossSynthesize(donorSignal, carrierSignal, userOptions = {}) {
     covered: 0, held: 0, bypassed: 0,
     donorGapBins: 0, unexcitedBins: 0, refusedBoostBins: 0,
     binTotal: 0, gainMin: Infinity, gainMax: -Infinity,
+    // Frames where the donor had no valid source spectrum and the transfer was
+    // therefore not written (or was deferred to the last good frame).
+    noSourceFrames: 0,
+    refusedWriteFrames: 0,
+    heldWriteFrames: 0,
   };
+  // Index of the most recent donor frame with a valid source spectrum, used by
+  // lowEnergyPolicy 'hold'. -1 until the donor has produced one.
+  let lastValidDonorFrame = -1;
 
   for (let t = 0; t < cf; t++) {
     const tSec = (t * hop + fftSize / 2 - carrier.spec.pad) / workRate;
@@ -473,13 +566,54 @@ export function crossSynthesize(donorSignal, carrierSignal, userOptions = {}) {
       pos = Math.max(0, Math.min(donorFrames - 1, pos));
     }
 
-    const confB = interpFrame(donorObs, pos);
-    const shapeB = interpFrame(donorShapes, pos);
-    const fillB = interpFrame(donorFill, pos);
-    const i0 = Math.floor(pos);
+    // Which donor frame is actually sampled, after any hold/bypass decision.
+    // For a stretch/start map the frame at `pos` is the evidence. If it has no
+    // valid source spectrum we either defer to the last good frame ('hold') or
+    // refuse to write this carrier frame at all ('refuse').
+    const sampledDonorFrame = bypassed ? -1 : Math.floor(Math.min(donorFrames - 1, Math.max(0, pos)));
+    let sourceValid = sampledDonorFrame >= 0 && donorFrameValid[sampledDonorFrame] === 1;
+    let sourcePolicy = 'measured';
+    let posUsed = pos;
+    if (!sourceValid && !bypassed) {
+      stats.noSourceFrames++;
+      if (options.lowEnergyPolicy === 'hold' && lastValidDonorFrame >= 0) {
+        posUsed = lastValidDonorFrame;
+        sourcePolicy = 'held';
+        stats.heldWriteFrames++;
+        sourceValid = true;
+      } else {
+        sourcePolicy = 'refused';
+        stats.refusedWriteFrames++;
+      }
+    }
+    if (bypassed) {
+      sourcePolicy = 'bypassed';
+      sourceValid = false;
+    }
+    if (sourceValid && (sourcePolicy === 'measured' || sourcePolicy === 'held')) {
+      lastValidDonorFrame = Math.floor(posUsed);
+    }
+
+    const i0 = Math.floor(posUsed);
     const i1 = Math.min(donorFrames - 1, i0 + 1);
-    const fpos = pos - i0;
-    const refD = donorRefs[i0] * (1 - fpos) + donorRefs[i1] * fpos;
+    const fpos = posUsed - i0;
+    const blendable = donorFrameValid[i0] === 1 && donorFrameValid[i1] === 1;
+    // When either endpoint lacks a valid source, use only the sampled frame's
+    // evidence for every donor quantity. Otherwise a zero-confidence / floored
+    // shape from the invalid neighbour would bleed across the switch.
+    const confB = blendable ? interpFrame(donorObs, posUsed) : donorObs[i0];
+    let shapeB = blendable ? interpFrame(donorShapes, posUsed) : Float32Array.from(donorShapes[i0]);
+    const fillB = blendable ? interpFrame(donorFill, posUsed) : donorFill[i0];
+    const refD = blendable
+      ? donorRefs[i0] * (1 - fpos) + donorRefs[i1] * fpos
+      : donorRefs[i0];
+    // Spectral-edit overlay lives in the same band domain as the donor shape.
+    // It is applied after gap resolution and before the reference subtraction,
+    // so the edit changes shape, not absolute level, exactly like the donor
+    // itself. A refused/bypassed frame does not get the edit applied.
+    if (options.envelopeEdit && sourcePolicy !== 'refused' && sourcePolicy !== 'bypassed') {
+      shapeB = applyEnvelopeEdit(shapeB, options.envelopeEdit, nb);
+    }
 
     // Carrier reference over the bands the donor observes at this frame.
     const refC = bandReferenceDb(carrierEnvDb[t], confB, threshold);
@@ -501,6 +635,15 @@ export function crossSynthesize(donorSignal, carrierSignal, userOptions = {}) {
       // as a "donor gap" would inflate the extrapolated share with bins the user
       // explicitly excluded.
       if (k < kLo || k > kHi) {
+        g[k] = 0;
+        target[k] = carShapeRaw[k];
+        continue;
+      }
+      // Refused frame: the donor had no valid source spectrum and no earlier
+      // good frame to hold. Write no gain rather than a shape taken from the
+      // numerical floor. This is the "reject the write" branch; the caller sees
+      // it in coverage.refusedWriteFraction and in the automation trace.
+      if (sourcePolicy === 'refused') {
         g[k] = 0;
         target[k] = carShapeRaw[k];
         continue;
@@ -532,7 +675,28 @@ export function crossSynthesize(donorSignal, carrierSignal, userOptions = {}) {
     donorObsBins[t] = obsBin;
     donorFillBins[t] = fillMask;
     carrierShapeBins[t] = carShapeRaw;
-    refs[t] = { donor: refD, carrier: refC, diff: refD - refC };
+    refs[t] = {
+      donor: refD, carrier: refC, diff: refD - refC,
+      sourcePolicy, donorValid: sourceValid,
+      donorFrame: sourceValid ? Math.floor(posUsed) : -1,
+    };
+  }
+
+  // Frame-level trace of what the low-energy rule did. This is the data the
+  // automation lane records and the spectral-edit window reports; a refused
+  // frame is a write the host must not commit as donor-derived state.
+  const sourceTrace = new Array(cf);
+  const frameTimes = frameTimesOf(carrier.spec);
+  for (let t = 0; t < cf; t++) {
+    sourceTrace[t] = {
+      timeSec: frameTimes[t],
+      donor: refs[t].donor,
+      carrier: refs[t].carrier,
+      diff: refs[t].diff,
+      policy: refs[t].sourcePolicy,
+      donorValid: refs[t].donorValid,
+      donorFrame: refs[t].donorFrame,
+    };
   }
 
   // Excitation solo: carrier with its own envelope divided out, bounded and
@@ -552,7 +716,12 @@ export function crossSynthesize(donorSignal, carrierSignal, userOptions = {}) {
   let excitation = carrier.stft.synthesizeWithGain(carrier.spec, excitationDb, null, carrier.samples.length);
   excitation = scaleToRms(excitation, carrier.rms, 24);
 
-  let spectralOutput = carrier.stft.synthesizeWithGain(carrier.spec, gainsDb, bypassedFrames, carrier.samples.length);
+  // Bypassed frames carry gain 0 dB in the loop above, so the carrier passes
+  // through unchanged. Do NOT hand them to the synthesiser as "silent": that
+  // would omit the frame from the overlap-add sum and leave a hole (measured
+  // RMS ratio ~0.03 for the second half of a start-aligned bypass). Pass-through
+  // is the documented meaning of a time bypass.
+  let spectralOutput = carrier.stft.synthesizeWithGain(carrier.spec, gainsDb, null, carrier.samples.length);
 
   if (options.outputDurationSec && options.outputDurationSec > 0) {
     const want = Math.max(1, Math.round(options.outputDurationSec * workRate));
@@ -653,6 +822,10 @@ export function crossSynthesize(donorSignal, carrierSignal, userOptions = {}) {
     bypassedFrames,
     coverage,
     refs,
+    // Per-frame source evidence: whether the donor had a valid spectrum, which
+    // frame was used, and what the low-energy rule did. The automation lane
+    // reads this to decide whether a gain write may be committed.
+    sourceTrace: sourceTrace.map((s) => ({ ...s })),
     metrics: analysis.metrics,
     images: buildImages({
       donor, carrier, outSpec, outEnv, outAmp,
@@ -972,13 +1145,20 @@ function analyseResult(ctx) {
     fftSize,
     hop,
     binHz,
-    coverage: {
+      coverage: {
       frameFraction: cf ? stats.covered / cf : 0,
       heldFraction: cf ? stats.held / cf : 0,
       bypassFraction: cf ? stats.bypassed / cf : 0,
       donorGapBinFraction: stats.binTotal ? stats.donorGapBins / stats.binTotal : 0,
       unexcitedBinFraction: stats.binTotal ? stats.unexcitedBins / stats.binTotal : 0,
       refusedBoostBinFraction: stats.binTotal ? stats.refusedBoostBins / stats.binTotal : 0,
+      // Donor frames with no valid source spectrum, and what the loop did with
+      // each: refused (no gain written -> carrier passes through) or held
+      // (deferred to the last valid donor frame).
+      noSourceFrameFraction: cf ? stats.noSourceFrames / cf : 0,
+      refusedWriteFraction: cf ? stats.refusedWriteFrames / cf : 0,
+      heldWriteFraction: cf ? stats.heldWriteFrames / cf : 0,
+      lowEnergyPolicy: options.lowEnergyPolicy,
     },
     spectralFit: {
       meanAbsDb: scoredBands ? errSum / scoredBands : null,

@@ -170,8 +170,52 @@
     <div class="actions">
       <button id="run" class="primary">Run</button>
       <button id="defaults" type="button">Reset defaults</button>
+      <button id="openEdit" type="button">Open spectral editor…</button>
     </div>
     <p id="status" class="status">ready</p>
+
+    <fieldset class="automation-lane">
+      <legend>Host automation — norm-control gain</legend>
+      <p class="hint">
+        Rides the normaliser gain as an automation lane. A write made while the donor has
+        no valid source spectrum (silence / deep trough) is <em>rejected</em> or
+        <em>parked</em> rather than committed; the feedback below says which and why.
+      </p>
+      <label>Write gain (dB)
+        <span class="pair">
+          <input id="autoGainDb" type="number" min="-60" max="30" step="0.5" value="6">
+          <button id="autoWrite" type="button">Write to lane</button>
+        </span>
+      </label>
+      <label>At playhead (s)
+        <input id="autoTimeSec" type="number" min="0" step="0.05" value="0.2">
+      </label>
+      <label>Invalid-source policy
+        <select id="autoPolicy">
+          <option value="refuse">Reject the write</option>
+          <option value="park">Park it until source is valid</option>
+        </select>
+      </label>
+      <p id="autoFeedback" class="hint">Run once, then write a gain point.</p>
+      <div id="autoEvents" class="automation-events"></div>
+    </fieldset>
+
+    <fieldset class="automation-lane">
+      <legend>Spectral-edit overlay (cross-shaping control)</legend>
+      <p class="hint">
+        Adds a band-domain dB offset on top of the donor shape, before the reference is
+        removed. Runs the same kernel the tests exercise; re-renders cross-spectrum and
+        shaped sound.
+      </p>
+      <label>Band index
+        <input id="editBand" type="number" min="0" step="1" value="8">
+      </label>
+      <label>Offset (dB)
+        <input id="editDb" type="number" min="-24" max="24" step="0.5" value="6">
+      </label>
+      <label class="check"><input id="editEnabled" type="checkbox"> Apply edit overlay</label>
+      <p id="editFeedback" class="hint">No edit.</p>
+    </fieldset>
   </section>
 
   <section class="panel results">
@@ -251,6 +295,56 @@
     side's own envelope reference, so absolute level is not transplanted.
   </p>
 </footer>
+
+<dialog id="editDialog" class="editor">
+  <form method="dialog">
+    <header>
+      <h2>Spectral edit — two sources, cross-shaped</h2>
+      <button id="closeEdit" value="close" type="submit">Close</button>
+    </header>
+    <div class="editor-controls">
+      <label>Donor
+        <select id="editDonorPreset">
+          <option value="sweepingVowel" selected>Sweeping vowel</option>
+          <option value="staticNasal">Static nasal</option>
+          <option value="brightBandLimited">Bright band-limited</option>
+          <option value="noiseCloud">Noise cloud</option>
+        </select>
+      </label>
+      <label>Carrier
+        <select id="editCarrierPreset">
+          <option value="pulse220" selected>Pulse 220 Hz</option>
+          <option value="pulse90">Pulse 90 Hz</option>
+          <option value="whiteNoise">White noise</option>
+          <option value="pinkNoise">Pink noise</option>
+        </select>
+      </label>
+      <label>Edit band
+        <input id="editDialogBand" type="number" min="0" step="1" value="20">
+      </label>
+      <label>Offset (dB)
+        <input id="editDialogDb" type="number" min="-24" max="24" step="0.5" value="9">
+      </label>
+      <button id="editApply" type="button" class="primary">Apply &amp; compare</button>
+      <button id="editClear" type="button">Clear overlay</button>
+    </div>
+    <p id="editDialogStatus" class="hint">Choose two sources, then Apply.</p>
+    <div class="editor-viz">
+      <figure>
+        <figcaption>Cross spectrum (shaped carrier)</figcaption>
+        <canvas id="editCrossSpec"></canvas>
+      </figure>
+      <figure>
+        <figcaption>Gain map (overlay applied)</figcaption>
+        <canvas id="editGain"></canvas>
+      </figure>
+    </div>
+    <div class="editor-listen">
+      <button id="editPlayShaped" type="button">Play shaped sound</button>
+      <button id="editPlayCross" type="button">Play cross spectrum (spectral stage)</button>
+    </div>
+  </form>
+</dialog>
 
 <script type="module" src="app.js"></script>
 </body>

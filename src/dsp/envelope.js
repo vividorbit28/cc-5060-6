@@ -216,11 +216,16 @@ export function clamp01(x) {
 }
 
 export function smoothstep(edge0, edge1, x) {
+  // A degenerate ramp (edge1 === edge0) occurs when a caller passes a window
+  // whose limits collide (e.g. excitationRangeDb <= 6, so -range meets the
+  // fixed -6 dB edge). The naive (x - edge0) / 0 is 0/0 or +-Inf and poisons
+  // every downstream gain with NaN. Treat it as a hard step instead.
+  if (edge1 === edge0) return x < edge0 ? 0 : 1;
   const t = clamp01((x - edge0) / (edge1 - edge0));
   return t * t * (3 - 2 * t);
 }
 
-export function smoothEnvelopeTime(dbFrames, hopSec, sigmaSec) {
+export function smoothEnvelopeTime(dbFrames, hopSec, sigmaSec, validMask) {
   if (!(sigmaSec > 0) || dbFrames.length < 2) return dbFrames;
   const nb = dbFrames[0].length;
   const radius = Math.max(1, Math.round((sigmaSec * 2.5) / hopSec));
@@ -232,15 +237,45 @@ export function smoothEnvelopeTime(dbFrames, hopSec, sigmaSec) {
     ks += v;
   }
   for (let i = 0; i < kernel.length; i++) kernel[i] /= ks;
-  const out = new Array(dbFrames.length);
-  for (let t = 0; t < dbFrames.length; t++) {
-    const acc = new Float32Array(nb);
-    for (let j = -radius; j <= radius; j++) {
-      const idx = Math.max(0, Math.min(dbFrames.length - 1, t + j));
-      const kw = kernel[j + radius];
-      const fr = dbFrames[idx];
-      for (let b = 0; b < nb; b++) acc[b] += fr[b] * kw;
+  const n = dbFrames.length;
+  const out = new Array(n);
+  for (let t = 0; t < n; t++) {
+    // With a validity mask, an invalid frame (silence / no source spectrum)
+    // keeps its raw envelope, and a valid frame never blends across an invalid
+    // run. That is the "reset low-energy history at the switch" rule: the first
+    // valid frame after silence starts from its own measurement, not from a
+    // smoothed floor carried over from the gap.
+    if (validMask && !validMask[t]) {
+      out[t] = Float32Array.from(dbFrames[t]);
+      continue;
     }
+    let lo = -radius;
+    let hi = radius;
+    if (validMask) {
+      lo = 0;
+      hi = 0;
+      while (lo > -radius && t + lo - 1 >= 0 && validMask[t + lo - 1]) lo--;
+      while (hi < radius && t + hi + 1 < n && validMask[t + hi + 1]) hi++;
+    }
+    const acc = new Float32Array(nb);
+    let wsum = 0;
+    if (validMask) {
+      for (let j = lo; j <= hi; j++) {
+        const kw = kernel[j + radius];
+        const fr = dbFrames[t + j];
+        for (let b = 0; b < nb; b++) acc[b] += fr[b] * kw;
+        wsum += kw;
+      }
+    } else {
+      for (let j = -radius; j <= radius; j++) {
+        const idx = Math.max(0, Math.min(n - 1, t + j));
+        const kw = kernel[j + radius];
+        const fr = dbFrames[idx];
+        for (let b = 0; b < nb; b++) acc[b] += fr[b] * kw;
+        wsum += kw;
+      }
+    }
+    if (wsum > 0) for (let b = 0; b < nb; b++) acc[b] /= wsum;
     out[t] = acc;
   }
   return out;

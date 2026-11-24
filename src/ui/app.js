@@ -1,83 +1,13 @@
 // UI wiring for the cross-source shaper. All DSP runs locally in the page using
 // the same ES modules as the tests; no audio leaves the browser.
 
-import {
-  resonantTone,
-  generatePulseTrain,
-  generateNoise,
-  fadeInOut,
-} from '../dsp/sources.js';
+import { fadeInOut } from '../dsp/sources.js';
 import { crossSynthesize } from '../dsp/engine.js';
+import { recordAutomation } from '../dsp/automation.js';
+import { donorSamples, carrierSamples, PRESET_RATE } from '../dsp/presets.js';
+import { runEditorSession } from '../dsp/editor.js';
 
 const $ = (id) => document.getElementById(id);
-
-// ---------------------------------------------------------------------------
-// Voice presets
-// ---------------------------------------------------------------------------
-
-const PRESET_RATE = 44100;
-
-function donorSamples(preset, seconds, rate = PRESET_RATE) {
-  switch (preset) {
-    case 'sweepingVowel':
-      return resonantTone({
-        rate, durationSec: seconds, f0: 120, amplitude: 0.62, pulseWidthMs: 1.2,
-        formants: [
-          { freq: 520, bw: 85, gain: 1 },
-          { freq: 1450, bw: 130, gain: 0.62 },
-          { freq: 2850, bw: 210, gain: 0.34 },
-          { freq: 5200, bw: 420, gain: 0.14 },
-        ],
-        formantMod: { rateHz: 0.42, depthOct: 0.26 },
-        tremoloHz: 0.0001, tremoloDepth: 0,
-      });
-    case 'staticNasal':
-      return resonantTone({
-        rate, durationSec: seconds, f0: 110, amplitude: 0.6,
-        formants: [
-          { freq: 320, bw: 60, gain: 1 },
-          { freq: 1150, bw: 110, gain: 0.5 },
-          { freq: 2400, bw: 190, gain: 0.18 },
-        ],
-      });
-    case 'brightBandLimited': {
-      // Only the low two formants: the top octaves are genuinely unobserved,
-      // which exercises the gap policy.
-      return resonantTone({
-        rate, durationSec: seconds, f0: 140, amplitude: 0.6,
-        formants: [
-          { freq: 420, bw: 70, gain: 1 },
-          { freq: 880, bw: 90, gain: 0.7 },
-        ],
-        formantMod: { rateHz: 0.5, depthOct: 0.12 },
-      });
-    }
-    case 'noiseCloud':
-      return resonantTone({
-        rate, durationSec: seconds, f0: 120, amplitude: 0.5, source: 'noise',
-        noiseColor: 'pink', seed: 7,
-        formants: [
-          { freq: 700, bw: 180, gain: 1 },
-          { freq: 2100, bw: 320, gain: 0.6 },
-          { freq: 3800, bw: 500, gain: 0.3 },
-        ],
-        formantMod: { rateHz: 0.35, depthOct: 0.22 },
-      });
-    default:
-      throw new Error(`unknown donor preset ${preset}`);
-  }
-}
-
-function carrierSamples(preset, seconds, f0, rate = PRESET_RATE) {
-  switch (preset) {
-    case 'pulse220': return generatePulseTrain({ rate, durationSec: seconds, f0: f0 || 220, pulseWidthMs: 2, amplitude: 0.7 });
-    case 'pulse90': return generatePulseTrain({ rate, durationSec: seconds, f0: f0 || 90, pulseWidthMs: 2.5, amplitude: 0.7 });
-    case 'pulse330': return generatePulseTrain({ rate, durationSec: seconds, f0: f0 || 330, pulseWidthMs: 1.6, amplitude: 0.7 });
-    case 'whiteNoise': return generateNoise({ rate, durationSec: seconds, color: 'white', seed: 3, amplitude: 0.45 });
-    case 'pinkNoise': return generateNoise({ rate, durationSec: seconds, color: 'pink', seed: 4, amplitude: 0.5 });
-    default: throw new Error(`unknown carrier preset ${preset}`);
-  }
-}
 
 // ---------------------------------------------------------------------------
 // File loading (decoded via Web Audio, mixed to mono, resampled by the engine)
@@ -147,6 +77,12 @@ function readOptions() {
   const fMaxRaw = $('fMax').value.trim();
   const outDurRaw = $('outputDurationSec').value.trim();
   const workRateRaw = $('workRate').value;
+  let envelopeEdit = null;
+  if ($('editEnabled')?.checked) {
+    const band = Number($('editBand').value);
+    const db = Number($('editDb').value);
+    if (Number.isFinite(band) && Number.isFinite(db)) envelopeEdit = [{ band, db }];
+  }
   return {
     fftSize,
     hop: Math.max(1, Math.round(fftSize / overlap)),
@@ -172,6 +108,8 @@ function readOptions() {
     peakCeiling: Number($('peakCeiling').value),
     outputDurationSec: outDurRaw ? Number(outDurRaw) : null,
     workRate: workRateRaw ? Number(workRateRaw) : null,
+    lowEnergyPolicy: $('autoPolicy').value,
+    envelopeEdit,
   };
 }
 
@@ -224,6 +162,7 @@ async function run() {
     setStatus(`done in ${dt.toFixed(0)} ms · work rate ${result.workRate} Hz · ${result.output.length} samples`);
     drawAll(result);
     renderReport(result);
+    renderAutomation();
   } catch (e) {
     console.error(e);
     setStatus(`error: ${e.message}`, 'err');
@@ -234,7 +173,61 @@ async function run() {
 
 $('run').addEventListener('click', run);
 
+// ---------------------------------------------------------------------------
+// Host automation lane
+// ---------------------------------------------------------------------------
+
+let automationWrites = [];
+
+function renderAutomation() {
+  if (!last) {
+    $('autoFeedback').textContent = 'Run once, then write a gain point.';
+    $('autoEvents').innerHTML = '';
+    return;
+  }
+  if (!automationWrites.length) {
+    $('autoFeedback').textContent = 'No gain points written yet.';
+    $('autoEvents').innerHTML = '';
+    return;
+  }
+  const policy = $('autoPolicy').value;
+  const rec = recordAutomation(automationWrites, last.sourceTrace, { policy });
+  const bits = [`<span class="ok">${rec.accepted} committed</span>`];
+  if (rec.parked) bits.push(`<span class="warn">${rec.parked} parked</span>`);
+  if (rec.refused) bits.push(`<span class="bad">${rec.refused} rejected</span>`);
+  if (rec.parkedOpen.length) {
+    bits.push(`<span class="warn">${rec.parkedOpen.length} still parked (no valid source yet)</span>`);
+  }
+  $('autoFeedback').innerHTML = `Lane (policy: ${policy}): ${bits.join(' · ')}`;
+  // Show only the last handful, newest last, so feedback is visible without
+  // scrolling. A rejected write says why rather than disappearing.
+  const recent = rec.events.slice(-8);
+  $('autoEvents').innerHTML = recent.map((e) => {
+    const cls = e.status === 'committed' ? 'ok' : e.status === 'parked' ? 'warn' : 'bad';
+    const at = Number(e.timeSec).toFixed(2);
+    const rel = e.releasedAtSec != null ? ` → released @ ${Number(e.releasedAtSec).toFixed(2)}s` : '';
+    return `<div class="ev"><span class="t">${at}s</span>`
+      + `<span class="${cls}">${e.status}${rel}</span>`
+      + `<span class="why">${e.reason ?? ''}${e.gainDb != null ? ` (${e.gainDb > 0 ? '+' : ''}${e.gainDb} dB)` : ''}</span></div>`;
+  }).join('');
+}
+
+$('autoWrite').addEventListener('click', () => {
+  if (!last) { setStatus('run the analysis first', 'err'); return; }
+  const timeSec = Number($('autoTimeSec').value);
+  const gainDb = Number($('autoGainDb').value);
+  if (!Number.isFinite(timeSec) || !Number.isFinite(gainDb)) {
+    setStatus('write needs a finite time and gain', 'err');
+    return;
+  }
+  automationWrites.push({ timeSec, gainDb, id: automationWrites.length });
+  renderAutomation();
+});
+
+$('autoPolicy').addEventListener('change', renderAutomation);
+
 $('defaults').addEventListener('click', () => {
+  automationWrites = [];
   for (const [id, val] of Object.entries({
     fftSize: '2048', overlap: '4', bandsPerOctave: '12', fMin: '60', fMax: '8000',
     envSmoothSec: '0.15', noiseFloorDb: '90', confidenceThreshold: '0.5',
@@ -249,9 +242,16 @@ $('defaults').addEventListener('click', () => {
     if (el) el.value = val;
   }
   $('preserveCarrierLoudness').checked = true;
+  $('editEnabled').checked = false;
+  $('editBand').value = '8';
+  $('editDb').value = '6';
+  $('autoPolicy').value = 'refuse';
+  $('autoGainDb').value = '6';
+  $('autoTimeSec').value = '0.2';
   $('envSmoothOut').textContent = '0.15';
   $('noiseFloorOut').textContent = '90';
   $('confidenceOut').textContent = '0.50';
+  renderAutomation();
 });
 
 // ---------------------------------------------------------------------------
@@ -308,6 +308,82 @@ document.querySelectorAll('[data-solo]').forEach((btn) => {
 });
 
 $('stop').addEventListener('click', stopPlayback);
+
+// ---------------------------------------------------------------------------
+// Spectral editor window
+//
+// A second surface that picks two sources and an envelope-edit overlay, then
+// renders through the *same* crossSynthesize kernel. It exists so the cross-
+// shaping control is driven by the real computation, with its failure feedback,
+// not by a separate script. The cross spectrum and the shaped sound shown/played
+// here come from that kernel result.
+// ---------------------------------------------------------------------------
+
+const editState = { result: null, edit: null };
+
+function editStatus(msg, cls = '') {
+  const el = $('editDialogStatus');
+  el.textContent = msg;
+  el.className = 'hint' + (cls ? ' ' + cls : '');
+}
+
+function runEditor() {
+  const band = $('editDialogBand').value;
+  const db = $('editDialogDb').value;
+  try {
+    const session = runEditorSession({
+      donorPreset: $('editDonorPreset').value,
+      carrierPreset: $('editCarrierPreset').value,
+      band,
+      db,
+    });
+    editState.result = session.result;
+    editState.edit = session.edit;
+    drawEditor(session.result);
+    // Status is built from the kernel result itself (gain range, refusals,
+    // energy), so a failure shows up here instead of being swallowed.
+    editStatus(session.status);
+  } catch (e) {
+    console.error(e);
+    editStatus(`error: ${e.message}`, 'err');
+  }
+}
+
+function drawEditor(r) {
+  const painted = r.images;
+  // Cross spectrum: the spectral-stage analysis (carrier excited, donor shaped).
+  // Reuse the spectrogram renderer used by the main page.
+  const spec = r.images.spectralSpectrogram;
+  drawHeat($('editCrossSpec'), spec.data, spec.width, spec.height, 0, 1, true, { label: '' });
+  let gmax = 12;
+  for (const v of painted.gainDb) if (Number.isFinite(v)) gmax = Math.max(gmax, Math.abs(v));
+  drawHeat($('editGain'), painted.gainDb, painted.width, painted.height, -gmax, gmax, true, {
+    diverging: true, label: `+${gmax.toFixed(0)} / −${gmax.toFixed(0)} dB`,
+  });
+}
+
+$('openEdit').addEventListener('click', () => {
+  const dlg = $('editDialog');
+  if (typeof dlg.showModal === 'function') dlg.showModal();
+  else dlg.setAttribute('open', '');
+  runEditor();
+});
+
+$('editApply').addEventListener('click', runEditor);
+$('editClear').addEventListener('click', () => {
+  $('editDialogDb').value = '0';
+  runEditor();
+});
+
+$('editPlayShaped').addEventListener('click', () => {
+  if (!editState.result) { editStatus('apply the editor first', 'err'); return; }
+  playSamples(editState.result.output, editState.result.workRate, 'editor shaped sound');
+});
+
+$('editPlayCross').addEventListener('click', () => {
+  if (!editState.result) { editStatus('apply the editor first', 'err'); return; }
+  playSamples(editState.result.spectralOutput, editState.result.workRate, 'editor cross spectrum');
+});
 
 // ---------------------------------------------------------------------------
 // Canvas helpers
@@ -552,6 +628,7 @@ function renderReport(r) {
     ['Coverage — frames covered / held / bypassed', `${fmt(m.coverage.frameFraction * 100, 0)}% / ${fmt(m.coverage.heldFraction * 100, 0)}% / ${fmt(m.coverage.bypassFraction * 100, 0)}%`, ''],
     ['Donor-unobserved (gap) bins filled', fmt(m.coverage.donorGapBinFraction * 100, 1, '%'), ''],
     ['Unexcited bins / refused boosts', `${fmt(m.coverage.unexcitedBinFraction * 100, 1)}% / ${fmt(m.coverage.refusedBoostBinFraction * 100, 1)}%`, ''],
+    ['No-source frames — refused / held writes', `${fmt(m.coverage.noSourceFrameFraction * 100, 1)}% · ${fmt(m.coverage.refusedWriteFraction * 100, 1)}% / ${fmt(m.coverage.heldWriteFraction * 100, 1)}% (${m.coverage.lowEnergyPolicy})`, m.coverage.refusedWriteFraction > 0 ? 'warn' : ''],
     ['Resampled? donor / carrier', `${m.resample.donor.applied} / ${m.resample.carrier.applied}`, ''],
     ['Resample RMS ratio donor / carrier', `${fmt(m.resample.donor.rmsRatio, 3)} / ${fmt(m.resample.carrier.rmsRatio, 3)}`, ''],
     ['Output/carrier RMS', fmt(e.outputOverCarrierRms, 3), ''],
@@ -584,6 +661,9 @@ function renderReport(r) {
   }
   if (m.coverage.donorGapBinFraction > 0.5) {
     findings.push(`More than half of the shaping region has no donor observation (${fmt(m.coverage.donorGapBinFraction * 100, 0)}%), so most of the output timbre comes from the chosen gap policy (${r.options.freqGapMode}), not from measured donor content.`);
+  }
+  if (m.coverage.refusedWriteFraction > 0) {
+    findings.push(`${fmt(m.coverage.refusedWriteFraction * 100, 1)}% of carrier frames had no valid source spectrum (silence or below the absolute support floor) and their normaliser write was ${m.coverage.lowEnergyPolicy === 'hold' ? 'held to the last good donor frame' : 'refused, so the carrier passed through'}. This is the guard that stops a silence or deep trough from being turned into an amplified envelope.`);
   }
   if (m.coverage.bypassFraction > 0.02) {
     findings.push(`${fmt(m.coverage.bypassFraction * 100, 1)}% of carrier frames fall outside the donor time range and were passed through unchanged (time gap = ${r.options.timeGapMode === 'bypass' ? 'bypass' : 'held'}).`);

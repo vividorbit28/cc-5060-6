@@ -13,15 +13,33 @@ product, and the report says so explicitly.
 
 ```sh
 npm install          # only playwright-core, used by the UI smoke test
-npm test             # 21 DSP tests, node --test
+npm test             # 37 DSP + regression tests, node --test
 npm start            # static server on http://127.0.0.1:8080/
 npm run test:ui      # headless Chromium smoke test of the page
 ```
 
-Open the printed URL, press **Run**. The page offers built-in synthetic sources
-(resonant tones, pulse trains, white/pink noise) or your own files. Every stage can
-be soloed: donor, carrier, the excitation proxy, the spectral stage before level
-normalisation, and the final output.
+Open the printed URL (`http://127.0.0.1:8080/`), press **Run**. The page offers
+built-in synthetic sources (resonant tones, pulse trains, white/pink noise) or your
+own files. Every stage can be soloed: donor, carrier, the excitation proxy, the
+spectral stage before level normalisation, and the final output.
+
+The page also has two host-facing surfaces, both driven by the same DSP kernel as
+the tests:
+
+- **Host automation — norm-control gain.** Write a gain point at a playhead time.
+  If the donor has no valid source spectrum there (silence, or below the absolute
+  support floor) the write is *rejected* or *parked* (your choice of policy) and the
+  feedback line says which, and why. A parked write is released at the first valid
+  frame, never inside the silent gap.
+- **Open spectral editor…** picks two sources and a band-domain envelope-edit
+  overlay, then renders cross-spectrum and shaped sound through the real kernel.
+  The status line is built from that render (gain range, refused writes, output /
+  carrier RMS), so a failure is visible rather than hidden.
+
+If `npm run test:ui` cannot launch a browser in your environment (no Chromium
+binary), start the server with `npm start` and open the URL; the automation and
+editor compute paths are also covered headlessly by `npm test` through
+`src/dsp/automation.js` and `src/dsp/editor.js`.
 
 ## What it does
 
@@ -82,6 +100,37 @@ regions, donor-unobserved bands, gap-filled bands) and the amplitude contours.
   the shape domain, the excitation guard forbids boosting unexcited bins, and the
   reported audit shows the maximum gain actually applied in unexcited bins (0 in the
   tests).
+- **Silence and deep troughs.** A carrier frame whose loudest bin is numerical zero
+  (or below `absoluteSupportFloorDb`) has no measurable content, so it is never
+  declared excited — the relative bin-vs-peak test would otherwise read 0 dB and
+  mark silence as fully excited. When the *donor* has no valid source spectrum for a
+  frame, the normaliser write is refused (carrier passes through) or held to the last
+  good frame (`lowEnergyPolicy`), and the fraction is reported. Donor time smoothing
+  is reset at such a switch: the first valid frame after silence starts from its own
+  measurement, not a floor-blurred one. The spectral-editor overlay and the host
+  automation lane both obey this rule; a gain write during silence is parked or
+  rejected and reported, never committed into the lane.
+
+## Fixes in this revision
+
+Three numerical defects in the low-energy path were found and fixed, each with a
+regression test in `tests/lowenergy.test.js` and a checked-in golden file
+(`tests/golden/envelope.json`) for the envelope / gain numbers:
+
+- **Zero-frame over-excitation.** A frame peak of 0 made the relative support measure
+  degenerate (`0 dB` below a zero peak), so digital silence read as fully excited and
+  could receive positive gain. Fixed with an absolute support floor; silence now has
+  zero excitation and writes no gain.
+- **Degenerate `smoothstep`.** `excitationRangeDb <= 6` made the two edges coincide,
+  producing `0/0` (NaN) in the support ramp. Now treated as a hard step.
+- **Time bypass was a hole, not a pass-through.** Bypassed frames were handed to the
+  synthesiser as *silent*, omitting them from the overlap-add sum, so the tail of a
+  start-aligned bypass dropped to ~3% of the carrier instead of passing through.
+  Bypassed frames now carry 0 dB and pass through as documented.
+
+The spectral-edit overlay changes shape only (it is added before reference removal),
+so an edit boosts or cuts a band without rescaling the whole output — no global gain
+cut hides a local boom.
 
 ## Verification in the test suite
 
@@ -102,6 +151,14 @@ regions, donor-unobserved bands, gap-filled bands) and the amplitude contours.
 - Frequency- and time-gap policies stay distinguishable; different input rates are
   converted with RMS preserved; a silent or extremely quiet carrier produces no
   runaway amplification.
+- Digital-silence frames are never excited and never boosted; a donor with no valid
+  source spectrum refuses or parks the normaliser write and reports it to the
+  automation lane; the low-energy history is reset at the switch; a deep carrier
+  trough gets bounded local gain; time bypass passes the carrier through.
+- The spectral editor renders through the same kernel: a +12 dB overlay moves the
+  target shape by ~12 dB, and its status string is built from the kernel result.
+- Envelope and cross-gain numbers match `tests/golden/envelope.json` (numeric
+  regression, not a re-derivation).
 
 `npm run test:ui` drives the real page in headless Chromium: it runs the analysis,
 checks the report text (including the "not separation" statement and the limitations),
@@ -132,9 +189,14 @@ src/dsp/resample.js   Kaiser sinc resampler, windows, rms/peak
 src/dsp/stft.js       STFT analysis / weighted overlap-add synthesis
 src/dsp/envelope.js   log bands, cepstral spectral envelope, observability
 src/dsp/sources.js    deterministic synthetic donors / carriers
+src/dsp/presets.js    built-in donor/carrier presets shared by UI and tests
 src/dsp/engine.js     cross-synthesis pipeline, gaps, audit, metrics, images
+src/dsp/automation.js host automation lane: commit / park / refuse gain writes
+src/dsp/editor.js     spectral-editor session (two sources + overlay -> kernel)
 src/ui/               index.html, style.css, app.js (Web Audio playback + canvases)
 tests/dsp.test.js     DSP test suite
+tests/lowenergy.test.js  low-energy / trough regression suite
+tests/golden/envelope.json  checked-in numeric regression values
 tools/serve.mjs       dependency-free static server
 tools/ui-smoke.mjs    headless Chromium smoke test
 ```

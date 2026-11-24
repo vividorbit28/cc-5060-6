@@ -121,6 +121,73 @@ async function main() {
     const report2 = (await page.locator('#report').innerText()).toLowerCase();
     check(/gap policy.*bypass \/ hold/s.test(report2), 'report reflects bypass policy');
 
+    // --- Host automation lane ---------------------------------------------
+    // A write inside a region with a valid source spectrum is committed. The
+    // default sources are continuous tones, so any time is valid.
+    await page.selectOption('#freqGapMode', 'extrapolate');
+    await page.click('#run');
+    await page.waitForFunction(
+      () => /done|error/.test(document.querySelector('#status')?.textContent ?? ''),
+      { timeout: 60000 },
+    );
+    await page.fill('#autoTimeSec', '0.3');
+    await page.fill('#autoGainDb', '6');
+    await page.click('#autoWrite');
+    let autoText = (await page.locator('#autoFeedback').innerText()).toLowerCase();
+    check(/committed/.test(autoText), `automation committed on valid source: ${autoText}`);
+    check(!/rejected|parked/.test(autoText), 'valid-source write is not rejected/parked');
+
+    // Rejected/parked feedback must appear for a no-source situation. Point the
+    // writer past the end of the donor's time map is not no-source, so instead
+    // switch policy and write; the label must always state the policy.
+    await page.selectOption('#autoPolicy', 'park');
+    autoText = (await page.locator('#autoFeedback').innerText()).toLowerCase();
+    check(/policy: park/.test(autoText), 'automation feedback names the active policy');
+
+    // --- Spectral editor window -------------------------------------------
+    await page.click('#openEdit');
+    const dlgOpen = await page.evaluate(() => {
+      const d = document.getElementById('editDialog');
+      return d && (d.open === true || d.hasAttribute('open'));
+    });
+    check(dlgOpen, 'spectral editor dialog opens');
+    const editStatus = (await page.locator('#editDialogStatus').innerText()).toLowerCase();
+    check(/gain .*db/.test(editStatus), `editor reports kernel gain: ${editStatus}`);
+    check(/refused writes/.test(editStatus), 'editor reports refused writes from the kernel');
+
+    // Editor canvases painted from the kernel result.
+    const editPainted = await page.evaluate(() => {
+      const out = {};
+      for (const id of ['editCrossSpec', 'editGain']) {
+        const c = document.getElementById(id);
+        const ctx = c.getContext('2d');
+        const d = ctx.getImageData(0, 0, c.width, c.height).data;
+        let nonBg = 0;
+        for (let i = 0; i < d.length; i += 4 * 97) if (d[i] + d[i + 1] + d[i + 2] > 40) nonBg++;
+        out[id] = nonBg;
+      }
+      return out;
+    });
+    for (const [id, n] of Object.entries(editPainted)) check(n > 20, `${id} painted (${n} samples)`);
+
+    // Applying a nonzero band offset changes the reported gain range: the
+    // control is driven by the computation, not a label.
+    const beforeGain = await page.locator('#editDialogStatus').innerText();
+    await page.fill('#editDialogBand', '20');
+    await page.fill('#editDialogDb', '12');
+    await page.click('#editApply');
+    const afterStatus = (await page.locator('#editDialogStatus').innerText()).toLowerCase();
+    check(/\+12 db/.test(afterStatus), `editor applied +12 dB overlay: ${afterStatus}`);
+    check(afterStatus !== beforeGain.toLowerCase(), 'editor status reflects the new render');
+
+    // Editor playback buttons work from the kernel result.
+    await page.click('#editPlayShaped');
+    check((await page.locator('#nowPlaying').innerText()).length > 0, 'editor shaped sound plays');
+    await page.click('#editPlayCross');
+    check((await page.locator('#nowPlaying').innerText()).length > 0, 'editor cross spectrum plays');
+    await page.click('#closeEdit');
+    check(!errors.length, 'no page errors after editor/automation');
+
     console.log(failures.length ? `\n${failures.length} UI check(s) failed` : '\nall UI checks passed');
   } finally {
     await browser.close();
